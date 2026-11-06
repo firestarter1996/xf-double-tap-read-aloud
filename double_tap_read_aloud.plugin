@@ -1,0 +1,216 @@
+__id__ = "double_tap_read_aloud"
+__name__ = "Double Tap Read Aloud"
+__description__ = "Double tap a message that has a Read Aloud button to start reading it aloud. Double tap again while it plays to pause, and again to resume. Made by [firestarter1996](https://github.com/firestarter1996)."
+__author__ = "firestarter1996"
+__version__ = "1.0.0"
+
+# How it works: ChatActivity's item click listener (an anonymous OnItemClickListenerExtended)
+# decides per tap whether a message has a double tap (hasDoubleTap) and runs it (onDoubleTap).
+# Both are hooked once, the first time a chat sets that listener, so nothing runs at app start
+# and nothing runs per frame. Per tap the plugin reads the message's inline keyboard (a handful
+# of buttons) and, on a double tap, presses the right button exactly like a finger would
+# (SendMessagesHelper.sendCallback), so the bot gets a normal callback query:
+#   live player (tts:pos, label not Done or Stopped)  -> tts:pos   = play / pause toggle
+#   finished player (Done / Stopped label)            -> tts:read  = read it again
+#   old reply panel (tts:pause / tts:resume)          -> pause or resume by its label
+#   plain message with Read Aloud (tts:read)          -> tts:read  = start reading
+# Messages with no Read Aloud button keep XF's own double tap, except in the chats listed in
+# the settings (the bridge group by default), where the double tap does nothing at all.
+# Logcat tag: DoubleTapRead (errors only, at most 5).
+
+import threading
+import time
+
+from java import jclass
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, Switch, Input
+
+LOG_TAG = "DoubleTapRead"
+BRIDGE_DIALOG = "-4209533823"
+
+
+def _log(msg):
+    try:
+        jclass("android.util.Log").i(LOG_TAG, str(msg))
+    except Exception:
+        pass
+
+
+class DoubleTapReadAloudPlugin(BasePlugin):
+
+    def create_settings(self):
+        return [
+            Header(text="Double Tap Read Aloud"),
+            Switch(key="enabled", text="Double tap reads the message aloud", default=True, on_change=self._reset),
+            Switch(key="quiet_others", text="In the chats below, a double tap on other messages does nothing", default=True, on_change=self._reset),
+            Input(key="chats", text="Chats (dialog ids, comma separated)", default=BRIDGE_DIALOG, on_change=self._reset),
+        ]
+
+    def on_plugin_load(self):
+        self.errors = 0
+        self.hooked = set()
+        self.lock = threading.Lock()
+        self.conf = None
+        self.cell_cls = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        self.inline_cls = find_class("org.telegram.tgnet.TLRPC$TL_replyInlineMarkup")
+        self.haptic = jclass("android.view.HapticFeedbackConstants").KEYBOARD_TAP
+        rlv = find_class("org.telegram.ui.Components.RecyclerListView")
+        ext = find_class("org.telegram.ui.Components.RecyclerListView$OnItemClickListenerExtended")
+        if rlv is None or ext is None or self.cell_cls is None:
+            _log("classes not found")
+            return
+        plugin = self
+
+        class SetListenerHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    lst = param.args[0]
+                    if lst is not None:
+                        plugin._hook_listener(lst.getClass())
+                except Exception as e:
+                    plugin._err("set listener: %s" % e)
+
+        self.hook_method(rlv.getDeclaredMethod("setOnItemClickListener", ext), SetListenerHook())
+        # a chat already open when the plugin loads set its listener before the hook above existed:
+        # find that listener class once, off the UI thread (a few ms, startup only)
+        threading.Thread(target=self._scan, args=(ext,), daemon=True).start()
+        _log("loaded %s" % __version__)
+
+    def _scan(self, ext):
+        t0 = time.monotonic()
+        try:
+            for i in range(1, 700):
+                c = find_class("org.telegram.ui.ChatActivity$%d" % i)
+                if c is not None and ext.isAssignableFrom(c):
+                    self._hook_listener(c)
+                    if self.hooked:
+                        break
+        except Exception as e:
+            self._err("scan: %s" % e)
+        _log("listener scan %.0f ms, hooked %s" % ((time.monotonic() - t0) * 1000, sorted(self.hooked)))
+
+    def on_plugin_unload(self):
+        self.hooked = set()
+
+    def _err(self, m):
+        if self.errors < 5:
+            self.errors += 1
+            _log(m)
+
+    def _settings(self):
+        if self.conf is None:
+            chats = set()
+            for part in str(self.get_setting("chats", BRIDGE_DIALOG) or "").split(","):
+                part = part.strip()
+                if part.lstrip("-").isdigit():
+                    chats.add(int(part))
+            self.conf = (bool(self.get_setting("enabled", True)), bool(self.get_setting("quiet_others", True)), chats)
+        return self.conf
+
+    def _reset(self, *a):
+        self.conf = None
+
+    def _hook_listener(self, cls):
+        with self.lock:
+            self._hook_listener_locked(cls)
+
+    def _hook_listener_locked(self, cls):
+        name = str(cls.getName())
+        if name in self.hooked or not name.startswith("org.telegram.ui.ChatActivity$"):
+            return
+        has_m = None
+        on_m = None
+        for m in cls.getDeclaredMethods():
+            n = m.getName()
+            if n == "hasDoubleTap" and len(m.getParameterTypes()) == 2:
+                has_m = m
+            elif n == "onDoubleTap" and len(m.getParameterTypes()) == 4:
+                on_m = m
+        if has_m is None or on_m is None:
+            return
+        self.hooked.add(name)
+        outer = cls.getDeclaredField("this$0")
+        outer.setAccessible(True)
+        plugin = self
+
+        class HasHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    act = plugin._decide(param.args[0], outer.get(param.thisObject))
+                    if act is not None:
+                        param.setResult(True)     # also for "none": a single tap stays a single tap, the double tap is swallowed
+                except Exception as e:
+                    plugin._err("has: %s" % e)
+
+        class OnHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    chat = outer.get(param.thisObject)
+                    act = plugin._decide(param.args[0], chat)
+                    if act is None:
+                        return
+                    param.setResult(None)
+                    if act != "none":
+                        view = param.args[0]
+                        btn = act
+                        chat.getSendMessagesHelper().sendCallback(True, view.getPrimaryMessageObject(), btn, chat)
+                        view.performHapticFeedback(plugin.haptic)
+                except Exception as e:
+                    plugin._err("on: %s" % e)
+
+        self.hook_method(has_m, HasHook())
+        self.hook_method(on_m, OnHook())
+
+    def _decide(self, view, chat):
+        """None = leave XF alone, "none" = swallow the double tap, else the button to press."""
+        enabled, quiet, chats = self._settings()
+        if not enabled or not self.cell_cls.isInstance(view):
+            return None
+        mo = view.getPrimaryMessageObject()
+        if mo is None:
+            return None
+        btn = self._pick(mo.messageOwner.reply_markup, mo.messageOwner.message)
+        if btn is not None:
+            return btn
+        if quiet and chats and int(chat.getDialogId()) in chats:
+            return "none"
+        return None
+
+    def _pick(self, markup, text):
+        if markup is None or not self.inline_cls.isInstance(markup):
+            return None
+        read = pos = pause = resume = None
+        first = None
+        rows = markup.rows
+        for i in range(rows.size()):
+            btns = rows.get(i).buttons
+            for j in range(btns.size()):
+                b = btns.get(j)
+                try:
+                    raw = b.getData()
+                except Exception:
+                    raw = None
+                if raw is None or len(raw) < 4 or len(raw) > 12:
+                    continue
+                d = bytes((x & 255) for x in raw)
+                if not d.startswith(b"tts:"):
+                    continue
+                if first is None:
+                    first = str(b.text or "")
+                if d == b"tts:read" and read is None:
+                    read = b
+                elif d == b"tts:pos" and pos is None:
+                    pos = b
+                elif d == b"tts:pause":
+                    pause = b
+                elif d == b"tts:resume":
+                    resume = b
+        if pos is not None:
+            if first and first[:1] in ("✅", "⏹"):     # finished panel: read it again
+                return read
+            return pos
+        if pause is not None or resume is not None:
+            paused = str(text or "").startswith("⏸")    # old reply panel: its text says Paused
+            return (resume or pause) if paused else (pause or resume)
+        return read
