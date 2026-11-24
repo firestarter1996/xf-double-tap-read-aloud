@@ -2,7 +2,7 @@ __id__ = "double_tap_read_aloud"
 __name__ = "Double Tap Read Aloud"
 __description__ = "Double tap a message that has a Read Aloud button to start reading it aloud. Double tap again while it plays to pause, and again to resume. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # How it works: ChatActivity's item click listener (an anonymous OnItemClickListenerExtended)
 # decides per tap whether a message has a double tap (hasDoubleTap) and runs it (onDoubleTap).
@@ -17,6 +17,15 @@ __version__ = "1.0.0"
 # Messages with no Read Aloud button keep XF's own double tap, except in the chats listed in
 # the settings (the bridge group by default), where the double tap does nothing at all.
 # Logcat tag: DoubleTapRead (errors only, at most 5).
+# 1.1.0 (11-24-2026, owner: "When a narration has completed, double tapping the message ... should restart it"):
+#  - the finished check reads the PLAYER's label (the first tts:pos button). Since 11-23 the panel's top row is the
+#    message counter (tts:cnt), so a Stopped panel was taken for a live one and got Play / Pause (bridge: "Nothing is
+#    playing"). Now Done and Stopped panels get tts:read again.
+#  - a part of a split answer (the bridge ends every part but the last with U+2063 and only the last part carries the
+#    buttons) presses the buttons of the LAST part of its group, so a double tap anywhere on the answer works.
+#  - test phone guard: when files/tts_test_phone.flag exists (only ever on the Pixel 6 Pro), no tts: or clip: button
+#    press leaves the phone (Read Aloud always plays on the 8 Pro, and a stress test tap there played a wsl2 reply on
+#    his phone 11-24-2026 10:59 AM). The press is logged instead. One file check per button press, at most every 20 s.
 
 import threading
 import time
@@ -75,7 +84,59 @@ class DoubleTapReadAloudPlugin(BasePlugin):
         # a chat already open when the plugin loads set its listener before the hook above existed:
         # find that listener class once, off the UI thread (a few ms, startup only)
         threading.Thread(target=self._scan, args=(ext,), daemon=True).start()
+        self.test_flag = (False, 0.0)
+        try:
+            self._hook_guard()
+        except Exception as e:
+            self._err("guard: %s" % e)
         _log("loaded %s" % __version__)
+
+    def _is_test_phone(self):
+        on, t = self.test_flag
+        now = time.monotonic()
+        if now - t > 20.0:
+            try:
+                ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+                on = bool(jclass("java.io.File")(ctx.getFilesDir(), "tts_test_phone.flag").exists())
+            except Exception:
+                on = False
+            self.test_flag = (on, now)
+        return on
+
+    def _hook_guard(self):
+        smh = find_class("org.telegram.messenger.SendMessagesHelper")
+        target = None
+        for m in smh.getDeclaredMethods():
+            if m.getName() == "sendCallback" and len(m.getParameterTypes()) == 6:
+                target = m
+        if target is None:
+            _log("guard: sendCallback not found")
+            return
+        plugin = self
+
+        class GuardHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    if not plugin._is_test_phone():
+                        return
+                    btn = param.args[2]
+                    data = btn.getData() if btn is not None else None
+                    if data is None or len(data) < 4 or len(data) > 24:
+                        return
+                    d = bytes((b & 0xFF) for b in data)
+                    if d.startswith(b"tts:") or d.startswith(b"clip:"):
+                        param.setResult(None)
+                        mid = -1
+                        try:
+                            mid = int(param.args[1].getId())
+                        except Exception:
+                            pass
+                        _log("test phone: held %s on message %d" % (d.decode("ascii", "replace"), mid))
+                except Exception as e:
+                    plugin._err("guard hook: %s" % e)
+
+        self.hook_method(target, GuardHook())
+        _log("guard: ok")
 
     def _scan(self, ext):
         t0 = time.monotonic()
@@ -153,8 +214,8 @@ class DoubleTapReadAloudPlugin(BasePlugin):
                     param.setResult(None)
                     if act != "none":
                         view = param.args[0]
-                        btn = act
-                        chat.getSendMessagesHelper().sendCallback(True, view.getPrimaryMessageObject(), btn, chat)
+                        mo, btn = act
+                        chat.getSendMessagesHelper().sendCallback(True, mo, btn, chat)
                         view.performHapticFeedback(plugin.haptic)
                 except Exception as e:
                     plugin._err("on: %s" % e)
@@ -172,9 +233,50 @@ class DoubleTapReadAloudPlugin(BasePlugin):
             return None
         btn = self._pick(mo.messageOwner.reply_markup, mo.messageOwner.message)
         if btn is not None:
-            return btn
+            return (mo, btn)
+        try:
+            tx = str(mo.messageOwner.message or "")
+        except Exception:
+            tx = ""
+        if tx.endswith("\u2063"):
+            got = self._last_part(mo, chat)
+            if got is not None:
+                return got
         if quiet and chats and int(chat.getDialogId()) in chats:
             return "none"
+        return None
+
+    def _last_part(self, mo, chat):
+        """A split answer's part without buttons: the next parts of its group (newer ids in the same topic, each part
+        but the last ending with U+2063), up to 8, until the one with the Read Aloud buttons -> (message, button)."""
+        try:
+            msgs = getattr(chat, "messages", None)
+            if msgs is None:
+                return None
+            mid, top = int(mo.getId()), int(mo.getTopicId())
+            n = min(int(msgs.size()), 300)
+            later = {}
+            for i in range(n):
+                m = msgs.get(i)
+                try:
+                    i_d = int(m.getId())
+                    if mid < i_d <= mid + 40 and int(m.getTopicId()) == top:
+                        later[i_d] = m
+                except Exception:
+                    continue
+            hops = 0
+            for i_d in sorted(later):
+                m = later[i_d]
+                btn = self._pick(m.messageOwner.reply_markup, m.messageOwner.message)
+                if btn is not None:
+                    return (m, btn)
+                if not str(m.messageOwner.message or "").endswith("\u2063"):
+                    return None
+                hops += 1
+                if hops >= 8:
+                    return None
+        except Exception as e:
+            self._err("last part: %s" % e)
         return None
 
     def _pick(self, markup, text):
@@ -187,28 +289,31 @@ class DoubleTapReadAloudPlugin(BasePlugin):
             btns = rows.get(i).buttons
             for j in range(btns.size()):
                 b = btns.get(j)
+                raw = None
                 try:
                     raw = b.getData()
                 except Exception:
-                    raw = None
+                    try:
+                        raw = b.data          # 1.1.0: this XF build has the field only (getData() threw, nothing matched)
+                    except Exception:
+                        raw = None
                 if raw is None or len(raw) < 4 or len(raw) > 12:
                     continue
                 d = bytes((x & 255) for x in raw)
                 if not d.startswith(b"tts:"):
                     continue
-                if first is None:
-                    first = str(b.text or "")
                 if d == b"tts:read" and read is None:
                     read = b
                 elif d == b"tts:pos" and pos is None:
                     pos = b
+                    first = str(b.text or "")      # 1.1.0: the player's own label, never the counter row
                 elif d == b"tts:pause":
                     pause = b
                 elif d == b"tts:resume":
                     resume = b
         if pos is not None:
             if first and first[:1] in ("✅", "⏹"):     # finished panel: read it again
-                return read
+                return read or pos                     # a ✅ Done panel has no tts:read; its ▶ Play reads it again
             return pos
         if pause is not None or resume is not None:
             paused = str(text or "").startswith("⏸")    # old reply panel: its text says Paused

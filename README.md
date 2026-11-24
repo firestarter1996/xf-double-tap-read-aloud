@@ -11,11 +11,13 @@ My bridge bot puts a Read Aloud button under every message it posts, and the but
 * Double tap a message with a Read Aloud button: the plugin presses that button for you, so reading starts.
 * Double tap a message that is being read (its keyboard shows the player): the plugin presses the player, which pauses or resumes.
 * Double tap a message whose player shows Done or Stopped: it is read again from the start.
+* Double tap any part of a long answer that was split into several messages: the buttons under its last part are pressed, so the whole answer is read.
+* Test phone guard: when the file `tts_test_phone.flag` exists in XF's files folder, no Read Aloud or Copy button press leaves that phone; it is only logged. I keep it on my test phone so a test can never start reading on my daily phone.
 * Messages without a Read Aloud button keep XF's normal double tap, except in the chats you list in the settings, where a double tap on them does nothing (so no stray reactions land in the bot's group).
 
 Settings: a switch for the whole thing, a switch for the quiet chats, and the list of quiet chats (dialog ids).
 
-Buttons are recognized by their callback data: `tts:read` starts reading, `tts:pos` is the play and pause toggle, `tts:pause` and `tts:resume` are the older reply panel. Any bot that uses the same data works.
+Buttons are recognized by their callback data: `tts:read` starts reading, `tts:pos` is the play and pause toggle (its label tells a finished player from a live one; a counter row above it is skipped), `tts:pause` and `tts:resume` are the older reply panel. Any bot that uses the same data works.
 
 ## Install
 
